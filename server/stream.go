@@ -187,6 +187,7 @@ type StreamSourceInfo struct {
 	Lag               uint64                   `json:"lag"`
 	Active            time.Duration            `json:"active"`
 	Error             *ApiError                `json:"error,omitempty"`
+	FilterTime        *time.Duration           `json:"filter_time,omitempty"`
 	FilterSubject     string                   `json:"filter_subject,omitempty"`
 	SubjectTransforms []SubjectTransformConfig `json:"subject_transforms,omitempty"`
 }
@@ -196,6 +197,7 @@ type StreamSource struct {
 	Name              string                   `json:"name"`
 	OptStartSeq       uint64                   `json:"opt_start_seq,omitempty"`
 	OptStartTime      *time.Time               `json:"opt_start_time,omitempty"`
+	FilterTime        *time.Duration           `json:"filter_time,omitempty"`
 	FilterSubject     string                   `json:"filter_subject,omitempty"`
 	SubjectTransforms []SubjectTransformConfig `json:"subject_transforms,omitempty"`
 	External          *ExternalStream          `json:"external,omitempty"`
@@ -325,11 +327,13 @@ type sourceInfo struct {
 	err   *ApiError           // The API error that caused the last consumer setup to fail.
 	fails int                 // The number of times trying to setup the consumer failed.
 	last  atomic.Int64        // Time the consumer was created or of last message it received.
+	lasts sync.Map            // Keep last message timestamp by subjects	
 	lreq  time.Time           // The last time setupMirrorConsumer/setupSourceConsumer was called.
 	qch   chan struct{}       // Quit channel.
 	sip   bool                // Setup in progress.
 	wg    sync.WaitGroup      // WaitGroup for the consumer's go routine.
 	sf    string              // The subject filter.
+	tf    *time.Duration      // The time filter.
 	sfs   []string            // The subject filters.
 	trs   []*subjectTransform // The subject transforms.
 }
@@ -384,6 +388,15 @@ type ddentry struct {
 
 // Replicas Range
 const StreamMaxReplicas = 5
+
+
+func eraseSyncMap(m *sync.Map) {
+	m.Range(func(key interface{}, value interface{}) bool {
+		m.Delete(key)
+		return true
+	})
+}
+
 
 // AddStream adds a stream for the given account.
 func (a *Account) addStream(config *StreamConfig) (*stream, error) {
@@ -1833,9 +1846,9 @@ func (mset *stream) updateWithAdvisory(config *StreamConfig, sendAdvisory bool) 
 					var si *sourceInfo
 
 					if len(s.SubjectTransforms) == 0 {
-						si = &sourceInfo{name: s.Name, iname: s.iname, sf: s.FilterSubject}
+						si = &sourceInfo{name: s.Name, iname: s.iname, sf: s.FilterSubject, tf: s.FilterTime}
 					} else {
-						si = &sourceInfo{name: s.Name, iname: s.iname}
+						si = &sourceInfo{name: s.Name, iname: s.iname, tf: s.FilterTime}
 						si.trs = make([]*subjectTransform, len(s.SubjectTransforms))
 						si.sfs = make([]string, len(s.SubjectTransforms))
 						for i := range s.SubjectTransforms {
@@ -2133,7 +2146,7 @@ func (mset *stream) sourceInfo(si *sourceInfo) *StreamSourceInfo {
 		return nil
 	}
 
-	var ssi = StreamSourceInfo{Name: si.name, Lag: si.lag, Error: si.err, FilterSubject: si.sf}
+	var ssi = StreamSourceInfo{Name: si.name, Lag: si.lag, Error: si.err, FilterSubject: si.sf, FilterTime: si.tf}
 
 	trConfigs := make([]SubjectTransformConfig, len(si.sfs))
 	for i := range si.sfs {
@@ -3028,6 +3041,7 @@ func (mset *stream) trySetupSourceConsumer(iname string, seq uint64, startTime t
 	si.msgs = nil
 	si.err = nil
 	si.sip = true
+	eraseSyncMap(&si.lasts)
 
 	// Send the consumer create request
 	mset.outq.send(newJSPubMsg(subject, _EMPTY_, reply, nil, b, nil, 0))
@@ -3301,6 +3315,23 @@ func (mset *stream) processInboundSourceMsg(si *sourceInfo, m *inMsg) bool {
 	} else {
 		si.lag = pending - 1
 	}
+
+	// Do time filtering
+	now := time.Now()
+	if si.tf != nil {
+		value, ok := si.lasts.Load(m.subj)
+		if ok {
+			if ts, ok := value.(int64); ok {
+				if time.Unix(0, ts).Add(*si.tf).After(now) {
+					mset.skipMsgs(sseq, sseq)
+					mset.mu.Unlock()
+					return true
+				}
+			}
+		}
+	}
+	si.lasts.Store(m.subj, now.UnixNano())
+
 	node := mset.node
 	mset.mu.Unlock()
 
@@ -3516,7 +3547,7 @@ func (mset *stream) resetSourceInfo() {
 		var si *sourceInfo
 
 		if len(ssi.SubjectTransforms) == 0 {
-			si = &sourceInfo{name: ssi.Name, iname: ssi.iname, sf: ssi.FilterSubject}
+			si = &sourceInfo{name: ssi.Name, iname: ssi.iname, sf: ssi.FilterSubject, tf: ssi.FilterTime}
 		} else {
 			sfs := make([]string, len(ssi.SubjectTransforms))
 			trs := make([]*subjectTransform, len(ssi.SubjectTransforms))
