@@ -1736,6 +1736,10 @@ func (o *consumerMemStore) UpdateConfig(cfg *ConsumerConfig) error {
 	return nil
 }
 
+func (o *consumerMemStore) Sync() error {
+	return nil
+}
+
 func (o *consumerMemStore) Stop() error {
 	o.mu.Lock()
 	o.closed = true
