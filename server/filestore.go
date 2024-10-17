@@ -5235,6 +5235,7 @@ func (fs *fileStore) syncBlocks() {
 		return
 	}
 	blks := append([]*msgBlock(nil), fs.blks...)
+	consumers := append([]ConsumerStore(nil), fs.cfs...)
 	lmb := fs.lmb
 	fs.mu.RUnlock()
 
@@ -5304,6 +5305,10 @@ func (fs *fileStore) syncBlocks() {
 			}
 			mb.mu.Unlock()
 		}
+	}
+
+	for _, consumer := range consumers {
+		consumer.Sync()
 	}
 
 	fs.mu.Lock()
@@ -8445,22 +8450,24 @@ func (fs *fileStore) SyncDeleted(dbs DeleteBlocks) {
 ////////////////////////////////////////////////////////////////////////////////
 
 type consumerFileStore struct {
-	mu      sync.Mutex
-	fs      *fileStore
-	cfg     *FileConsumerInfo
-	prf     keyGen
-	aek     cipher.AEAD
-	name    string
-	odir    string
-	ifn     string
-	hh      hash.Hash64
-	state   ConsumerState
-	fch     chan struct{}
-	qch     chan struct{}
-	flusher bool
-	writing bool
-	dirty   bool
-	closed  bool
+	mu       sync.Mutex
+	fs       *fileStore
+	cfg      *FileConsumerInfo
+	prf      keyGen
+	aek      cipher.AEAD
+	name     string
+	odir     string
+	ifn      string
+	ifd      *os.File
+	hh       hash.Hash64
+	state    ConsumerState
+	fch      chan struct{}
+	qch      chan struct{}
+	needSync bool
+	flusher  bool
+	writing  bool
+	dirty    bool
+	closed   bool
 }
 
 func (fs *fileStore) ConsumerStore(name string, cfg *ConsumerConfig) (ConsumerStore, error) {
@@ -9021,6 +9028,8 @@ func init() {
 }
 
 func (o *consumerFileStore) writeState(buf []byte) error {
+	var err error
+
 	// Check if we have the index file open.
 	o.mu.Lock()
 	if o.writing || len(buf) == 0 {
@@ -9038,15 +9047,32 @@ func (o *consumerFileStore) writeState(buf []byte) error {
 
 	o.writing = true
 	o.dirty = false
-	ifn := o.ifn
+	ifd, ifn, fs := o.ifd, o.ifn, o.fs
 	o.mu.Unlock()
 
+	if ifd == nil {
+		<-dios
+		ifd, err = os.OpenFile(ifn, os.O_CREATE|os.O_RDWR, defaultFilePerms)
+		dios <- struct{}{}
+
+		if err != nil {
+			return fmt.Errorf("Error creating state file: %v", err)
+		}
+	}
+
 	// Lock not held here but we do limit number of outstanding calls that could block OS threads.
-	err := o.fs.writeFileWithOptionalSync(ifn, buf, defaultFilePerms)
+	_, err = ifd.WriteAt(buf, 0)
+	ifd.Truncate(int64(len(buf)))
+	if fs.fcfg.SyncAlways {
+		ifd.Sync()
+	}
 
 	o.mu.Lock()
+	o.ifd = ifd
 	if err != nil {
 		o.dirty = true
+	} else {
+		o.needSync = true
 	}
 	o.writing = false
 	o.mu.Unlock()
@@ -9198,16 +9224,44 @@ func (o *consumerFileStore) stateWithCopyLocked(doCopy bool) (*ConsumerState, er
 	}
 
 	// Read the state in here from disk..
-	<-dios
-	buf, err := os.ReadFile(o.ifn)
-	dios <- struct{}{}
+	var sz int
+	info, err := os.Stat(o.ifn)
+	if err == nil {
+		sz64 := info.Size()
+		if int64(int(sz64)) == sz64 {
+			sz = int(sz64)
+		} else {
+			return nil, errMsgBlkTooBig
+		}
+	}
 
-	if err != nil && !os.IsNotExist(err) {
+	if os.IsNotExist(err) || sz == 0 {
+		return state, nil
+	}
+
+	if o.ifd == nil {
+		<-dios
+		ifd, err := os.OpenFile(o.ifn, os.O_RDWR, defaultFilePerms)
+		dios <- struct{}{}
+
+		if err != nil {
+			return nil, fmt.Errorf("Error creating state file: %v", err)
+		}
+		o.ifd = ifd
+	}
+
+	if n, err := o.ifd.Seek(0, 0); n != 0 || err != nil {
 		return nil, err
 	}
 
-	if len(buf) == 0 {
-		return state, nil
+	buf := make([]byte, sz)
+
+	<-dios
+	_, err = io.ReadFull(o.ifd, buf)
+	dios <- struct{}{}
+
+	if err != nil {
+		return nil, err
 	}
 
 	// Check on encryption.
@@ -9371,6 +9425,17 @@ func decodeConsumerState(buf []byte) (*ConsumerState, error) {
 	return state, nil
 }
 
+func (o *consumerFileStore) Sync() error {
+	var err error
+	o.mu.Lock()
+	if o.needSync && o.ifd != nil {
+		err = o.ifd.Sync()
+		o.needSync = false
+	}
+	o.mu.Unlock()
+	return err
+}
+
 // Stop the processing of the consumers's state.
 func (o *consumerFileStore) Stop() error {
 	o.mu.Lock()
@@ -9399,15 +9464,27 @@ func (o *consumerFileStore) Stop() error {
 
 	o.odir = _EMPTY_
 	o.closed = true
-	ifn, fs := o.ifn, o.fs
+	ifd, fs := o.ifd, o.fs
+	o.ifd = nil
 	o.mu.Unlock()
 
 	fs.RemoveConsumer(o)
 
 	if len(buf) > 0 {
 		o.waitOnFlusher()
-		err = o.fs.writeFileWithOptionalSync(ifn, buf, defaultFilePerms)
+		if ifd != nil {
+			_, err = ifd.WriteAt(buf, 0)
+			ifd.Truncate(int64(len(buf)))
+			if fs.fcfg.SyncAlways {
+				ifd.Sync()
+			}
+		}
 	}
+
+	if ifd != nil {
+		ifd.Close()
+	}
+
 	return err
 }
 
@@ -9449,8 +9526,13 @@ func (o *consumerFileStore) delete(streamDeleted bool) error {
 	odir := o.odir
 	o.odir = _EMPTY_
 	o.closed = true
-	fs := o.fs
+	ifd, fs := o.ifd, o.fs
+	o.ifd = nil
 	o.mu.Unlock()
+
+	if ifd != nil {
+		ifd.Close()
+	}
 
 	// If our stream was not deleted this will remove the directories.
 	if odir != _EMPTY_ && !streamDeleted {
