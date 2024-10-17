@@ -342,6 +342,7 @@ type ConsumerStore interface {
 	BorrowState() (*ConsumerState, error)
 	EncodedState() ([]byte, error)
 	Type() StorageType
+	Sync() error
 	Stop() error
 	Delete() error
 	StreamDelete() error
