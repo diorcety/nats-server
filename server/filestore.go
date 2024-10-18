@@ -4422,15 +4422,26 @@ func (mb *msgBlock) truncate(sm *StoreMsg) (nmsgs, nbytes uint64, err error) {
 			mb.bek = bek
 			mb.bek.XORKeyStream(buf, buf)
 		}
-		n, err := mb.writeAt(buf, 0)
+
+		// Close FDs first.
+		mb.closeFDsLocked()
+
+		// We will write to a new file and mv/rename it in case of failure.
+		mfn := filepath.Join(mb.fs.fcfg.StoreDir, msgDir, fmt.Sprintf(newScan, mb.index))
+		<-dios
+		err = os.WriteFile(mfn, buf, defaultFilePerms)
+		dios <- struct{}{}
 		if err != nil {
+			os.Remove(mfn)
 			return 0, 0, fmt.Errorf("failed to rewrite compressed block: %w", err)
 		}
-		if n != len(buf) {
-			return 0, 0, fmt.Errorf("short write (%d != %d)", n, len(buf))
+		if err = os.Rename(mfn, mb.mfn); err != nil {
+			os.Remove(mfn)
+			return 0, 0, fmt.Errorf("failed to replace compressed block: %w", err)
 		}
-		mb.mfd.Truncate(int64(len(buf)))
-		mb.mfd.Sync()
+
+		// Make sure to sync
+		mb.needSync = true
 	} else if mb.mfd != nil {
 		mb.mfd.Truncate(eof)
 		mb.mfd.Sync()
@@ -7076,12 +7087,21 @@ func (fs *fileStore) Compact(seq uint64) (uint64, error) {
 			if nbuf, err = smb.cmp.Compress(nbuf); err != nil {
 				goto SKIP
 			}
+
+			// We will write to a new file and mv/rename it in case of failure.
+			mfn := filepath.Join(smb.fs.fcfg.StoreDir, msgDir, fmt.Sprintf(newScan, smb.index))
 			<-dios
-			err = os.WriteFile(smb.mfn, nbuf, defaultFilePerms)
+			err := os.WriteFile(mfn, nbuf, defaultFilePerms)
 			dios <- struct{}{}
 			if err != nil {
+				os.Remove(mfn)
 				goto SKIP
 			}
+			if err := os.Rename(mfn, smb.mfn); err != nil {
+				os.Remove(mfn)
+				goto SKIP
+			}
+
 			// Make sure to remove fss state.
 			smb.fss = nil
 			smb.clearCacheAndOffset()
