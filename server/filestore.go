@@ -4812,7 +4812,13 @@ func (mb *msgBlock) enableForWriting(fip bool) error {
 
 // Helper function to place a delete tombstone.
 func (mb *msgBlock) writeTombstone(seq uint64, ts int64) error {
-	return mb.writeMsgRecord(emptyRecordLen, seq|tbit, _EMPTY_, nil, nil, ts, true)
+	err := mb.writeMsgRecord(emptyRecordLen, seq|tbit, _EMPTY_, nil, nil, ts, true)
+
+	// Tombstone should be immediatly sync in order to avoid incoherences
+	if err == nil && mb.mfd != nil {
+		err = mb.mfd.Sync()
+	}
+	return err
 }
 
 // Will write the message record to the underlying message block.
