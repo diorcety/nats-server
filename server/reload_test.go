@@ -5955,6 +5955,75 @@ func TestConfigReloadRouteCompressionS2Auto(t *testing.T) {
 	}
 }
 
+func TestConfigReloadLeafNodes(t *testing.T) {
+	org := testDefaultLeafNodeCompression
+	testDefaultLeafNodeCompression = _EMPTY_
+	defer func() { testDefaultLeafNodeCompression = org }()
+
+	tmpl1 := `
+		port: -1
+		server_name: "%s"
+		leafnodes {
+			port: -1
+		}
+	`
+	conf1 := createConfFile(t, []byte(fmt.Sprintf(tmpl1, "A")))
+	s1, o1 := RunServerWithConfig(conf1)
+	defer s1.Shutdown()
+
+	conf2 := createConfFile(t, []byte(fmt.Sprintf(tmpl1, "B")))
+	s2, o2 := RunServerWithConfig(conf2)
+	defer s2.Shutdown()
+
+	port1 := o1.LeafNode.Port
+	port2 := o2.LeafNode.Port
+
+	tmpl2 := `
+		port: -1
+		server_name: "%s"
+		leafnodes {
+			remotes [
+				{
+					url: "nats://127.0.0.1:%d"
+				}
+			]
+		}
+	`
+	conf3 := createConfFile(t, []byte(fmt.Sprintf(tmpl2, "C", port1)))
+	s3, _ := RunServerWithConfig(conf3)
+	defer s3.Shutdown()
+
+	checkLeafNodeConnectedCount(t, s1, 1)
+	checkLeafNodeConnectedCount(t, s2, 0)
+	checkLeafNodeConnectedCount(t, s3, 1)
+
+	tmpl3 := `
+		port: -1
+		server_name: "%s"
+		leafnodes {
+			remotes [
+				{
+					url: "nats://127.0.0.1:%d"
+				},
+				{
+					url: "nats://127.0.0.1:%d"
+				}
+			]
+		}
+	`
+	reloadUpdateConfig(t, s3, conf3, fmt.Sprintf(tmpl3, "C", port1, port2))
+
+	checkLeafNodeConnectedCount(t, s1, 1)
+	checkLeafNodeConnectedCount(t, s2, 1)
+	checkLeafNodeConnectedCount(t, s3, 2)
+
+	reloadUpdateConfig(t, s3, conf3, fmt.Sprintf(tmpl2, "C", port2))
+
+	checkLeafNodeConnectedCount(t, s1, 0)
+	checkLeafNodeConnectedCount(t, s2, 1)
+	checkLeafNodeConnectedCount(t, s3, 1)
+}
+
 func TestConfigReloadLeafNodeCompression(t *testing.T) {
 	org := testDefaultLeafNodeCompression
 	testDefaultLeafNodeCompression = _EMPTY_

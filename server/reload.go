@@ -842,6 +842,7 @@ type leafNodeOption struct {
 	noopOption
 	tlsFirstChanged    bool
 	compressionChanged bool
+	remotesChanged     bool
 }
 
 func (l *leafNodeOption) Apply(s *Server) {
@@ -851,6 +852,38 @@ func (l *leafNodeOption) Apply(s *Server) {
 		for _, r := range opts.LeafNode.Remotes {
 			s.Noticef("Reloaded: LeafNode Remote to %v TLS HandshakeFirst value is: %v", r.URLs, r.TLSHandshakeFirst)
 		}
+	}
+	if l.remotesChanged {
+		var add_remotes []*RemoteLeafOpts
+		var remove_leafs []*client
+
+		s.mu.RLock()
+		// Check which leaf to remove
+		for _, l := range s.leafs {
+			if !s.remoteLeafNodeStillValid(l.leaf.remote) {
+				remove_leafs = append(remove_leafs, l)
+			}
+		}
+
+		// Check which remote to add
+		for _, ri := range opts.LeafNode.Remotes {
+			create := true
+			for _, l := range s.leafs {
+				if reflect.DeepEqual(ri.URLs, l.leaf.remote.URLs) {
+					create = false
+				}
+			}
+			if create {
+				add_remotes = append(add_remotes, ri)
+			}
+		}
+		s.mu.RUnlock()
+
+		// Apply changes
+		for _, l := range remove_leafs {
+			l.closeConnection(ClientClosed)
+		}
+		s.solicitLeafNodeRemotes(add_remotes)
 	}
 	if l.compressionChanged {
 		var leafs []*client
@@ -1426,12 +1459,12 @@ func (s *Server) diffOptions(newOpts *Options) ([]option, error) {
 				return false
 			}
 
-			// First check whether remotes changed at all. If they did not,
-			// skip them in the complete equal check.
-			if !leafRemotesChanged(tmpOld, tmpNew) {
-				tmpOld.Remotes = nil
-				tmpNew.Remotes = nil
-			}
+			// First check whether remotes changed at all.
+			remotesChanged := leafRemotesChanged(tmpOld, tmpNew)
+
+			// Skip all check on remotes, they are handled futher
+			tmpOld.Remotes = nil
+			tmpNew.Remotes = nil
 
 			// Special check for auth users to detect changes.
 			// If anything is off will fall through and fail below.
@@ -1478,6 +1511,7 @@ func (s *Server) diffOptions(newOpts *Options) ([]option, error) {
 			diffOpts = append(diffOpts, &leafNodeOption{
 				tlsFirstChanged:    handshakeFirstChanged,
 				compressionChanged: compressionChanged,
+				remotesChanged:     remotesChanged,
 			})
 		case "jetstream":
 			new := newValue.(bool)
